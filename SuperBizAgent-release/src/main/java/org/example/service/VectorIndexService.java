@@ -11,6 +11,7 @@ import lombok.Getter;
 import lombok.Setter;
 import org.example.constant.MilvusConstants;
 import org.example.dto.DocumentChunk;
+import org.example.service.parse.FileParserService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -45,6 +46,9 @@ public class VectorIndexService {
     @Value("${file.upload.path}")
     private String uploadPath;
 
+    @Autowired
+    private FileParserService fileParserService;
+
     /**
      * 索引指定目录下的所有文件
      * 
@@ -69,10 +73,11 @@ public class VectorIndexService {
 
             result.setDirectoryPath(directory.getAbsolutePath());
 
-            // 获取所有支持的文件
-            File[] files = directory.listFiles((dir, name) -> 
-                name.endsWith(".txt") || name.endsWith(".md")
-            );
+            // 获取所有支持格式的文件
+            File[] files = directory.listFiles((dir, name) -> {
+                String ext = name.substring(name.lastIndexOf('.') + 1).toLowerCase();
+                return fileParserService.supports(ext);
+            });
 
             if (files == null || files.length == 0) {
                 logger.warn("目录中没有找到支持的文件: {}", targetPath);
@@ -132,7 +137,11 @@ public class VectorIndexService {
         logger.info("开始索引文件: {}", path);
 
         // 1. 读取文件内容
-        String content = Files.readString(path);
+        String content = fileParserService.parse(path);
+        if (content == null || content.trim().isEmpty()) {
+            logger.warn("文件解析结果为空: {}", filePath);
+            throw new IllegalArgumentException("文件内容为空或无法解析: " + filePath);
+        }
         logger.info("读取文件: {}, 内容长度: {} 字符", path, content.length());
 
         // 2. 删除该文件的旧数据（如果存在）

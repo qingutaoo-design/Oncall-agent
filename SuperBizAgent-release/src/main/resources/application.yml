@@ -9,7 +9,7 @@ server:
 file:
   upload:
     path: ./uploads
-    allowed-extensions: txt,md
+    allowed-extensions: txt,md,pdf,docx,html,htm,csv,json
 
 milvus:
   host: localhost
@@ -21,6 +21,10 @@ milvus:
 
 # Spring AI Alibaba DashScope 配置
 spring:
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
   ai:
     dashscope:
       api-key: ${QWEN_KEY}  # 从环境变量读取或使用默认值
@@ -57,11 +61,11 @@ dashscope:
   embedding:
     model: text-embedding-v4  # 阿里云文本向量化模型
 
-# 文档分片配置
 document:
   chunk:
-    max-size: 800  # 每个分片最大字符数
-    overlap: 100   # 分片之间的重叠字符数
+    max-size: 800   # 每个分片最大字符数
+    overlap: 100    # 分片之间的重叠字符数
+    csv-rows-per-chunk: 5  # CSV文件每组行数（一组数据合并为一个chunk）
 
 # RAG 配置
 rag:
