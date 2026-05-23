@@ -1,301 +1,250 @@
-# 文件上传 400 报错排查与修复教程
+# 文件上传 400 报错：完整排查与修复教程
 
 ## 你遇到的问题
 
-当你尝试上传 PDF（或其他格式文件）到知识库时，后端返回了这样一个错误：
+尝试上传 PDF（或其他格式文件）到知识库时，后端返回：
 
 ```
 HTTP 400 Bad Request
 Required part 'file' is not present.
 ```
 
-**翻译成大白话**：后端说"我没收到你传的文件"。
+翻译成大白话：后端说"我没收到你传的文件"。
 
 ---
 
-## 为什么会这样？—— 三条路上的三把锁
+## 踩坑全景：四道关卡，四次排查
 
-可以把一次文件上传想象成**寄快递**，整个过程有三道关卡：
+可以把一次文件上传想象成**寄快递**：
 
 ```
-你（浏览器） → 前端的门卫检查 → 网络传输 → 后端门卫1(过滤器) → 后端门卫2(尺寸) → 业务处理
+浏览器 → 前端门卫 → 网络传输 → 后端过滤链 → 业务代码
 ```
 
-你的 PDF 没能送到后端，是因为**三道关卡各有一把锁**挡住了它：
+一条链路上有四道关卡挡住了你的 PDF，每一道都是试探性修复后发现下一道：
 
-| 锁的位置 | 锁的名字 | 它拦什么 |
-|---------|---------|---------|
-| 第一把锁 | 前端文件类型白名单 | PDF 不在名单里，前端直接说"格式不对" |
-| 第二把锁 | Spring Boot 文件大小限制（默认 1MB） | 文件稍微大一点，后端直接拒绝开门 |
-| 第三把锁 | FormContentFilter 偷吃请求体 | 后端门卫把快递拆开看了，后面的 MultipartResolver 拿到空盒子 |
-
-下面逐一拆解每把锁是怎么拦住你的，以及怎么打开它。
+| 序号 | 锁的名字 | 现象 | 它拦什么 |
+|------|---------|------|---------|
+| ① | 前端文件类型白名单 | 前端连文件都选不到 | PDF 不在 `accept` / `validateFileType` 名单里 |
+| ② | Spring Boot 默认 1MB 限制 | 小文件能传，大文件 400 | 超过 1MB 直接被拒绝 |
+| ③ | `@RequestParam` + MultipartResolver 链路问题 | Apifox 正确请求也 400 | Spring Boot 3.2 的过滤器链与 Spring 封装层打架 |
+| ④ | 最终方案：绕过 Spring 封装层 | — | 直接走 Servlet API，不走 `@RequestParam` |
 
 ---
 
-## 第一把锁：前端文件类型白名单
+## ① 第一道关：前端文件类型白名单
 
 ### 锁在哪里
 
-前端有两个地方限制了只能上传 `.txt` 和 `.md` 文件：
+前端两处代码限制了只能 `.txt` 和 `.md`：
 
-**位置 1：`index.html` — 文件选择框**
+**`index.html`：**
 
 ```html
 <input type="file" accept=".txt,.md,.markdown" style="display: none;">
 ```
 
-`accept` 属性告诉浏览器：打开文件选择窗口时，只显示这些后缀名的文件。你的 PDF 文件压根不会出现在选择窗口里。
-
-**位置 2：`app.js` — 文件类型校验函数**
+**`app.js`（有两处校验调用！）：**
 
 ```javascript
+// 位置1：handleFileSelect 里
+if (!this.validateFileType(file)) {
+    this.showNotification('只支持上传 TXT 或 Markdown (.md) 格式的文件', 'error');
+    return;
+}
+
+// 位置2：uploadFile 里（双重保险）
+if (!this.validateFileType(file)) {
+    this.showNotification('只支持上传 TXT 或 Markdown (.md) 格式的文件', 'error');
+    return;
+}
+
+// 校验函数本身
 validateFileType(file) {
-    const fileName = file.name.toLowerCase();
-    const allowedExtensions = ['.txt', '.md', '.markdown'];  // ← 这里只有三种
+    const allowedExtensions = ['.txt', '.md', '.markdown'];
     return allowedExtensions.some(ext => fileName.endsWith(ext));
 }
 ```
 
-即使你绕过了浏览器的 `accept` 限制（比如手动输入文件名），这个 JS 校验也会在点击上传前拦截，弹出提示"只支持上传 TXT 或 Markdown 格式的文件"，然后请求根本不会发出去。
+### 修复
 
-### 为什么会这样写
-
-因为这个项目最初只支持 Markdown 和纯文本文档。后来后端升级了（加了 PDF、Word 等格式支持），但前端没跟着改——就像大门拓宽了，但门卫手里还是旧的通行名单。
-
-### 怎么修
-
-把新支持的格式加到白名单里：
-
-**`index.html` 修改：**
+**`index.html`：**
 
 ```html
-<!-- 修改前 -->
-<input type="file" accept=".txt,.md,.markdown" style="display: none;">
-
-<!-- 修改后 -->
 <input type="file" accept=".txt,.md,.markdown,.pdf,.docx,.html,.htm,.csv,.json" style="display: none;">
 ```
 
-**`app.js` 修改：**
+**`app.js` — 改三处（校验函数 + 两处错误提示）：**
 
 ```javascript
-// 修改前
-const allowedExtensions = ['.txt', '.md', '.markdown'];
+// 错误提示（两处都改）
+this.showNotification('不支持的文件格式，支持: txt, md, pdf, docx, html, htm, csv, json', 'error');
 
-// 修改后
+// 校验函数
 const allowedExtensions = ['.txt', '.md', '.markdown', '.pdf', '.docx', '.html', '.htm', '.csv', '.json'];
 ```
 
-同时把错误提示也改一下，让用户知道现在支持哪些格式：
-
-```javascript
-// 修改前
-this.showNotification('只支持上传 TXT 或 Markdown (.md) 格式的文件', 'error');
-
-// 修改后
-this.showNotification('不支持的文件格式，支持: txt, md, pdf, docx, html, htm, csv, json', 'error');
-```
+> **坑**：修改后浏览器可能缓存了旧 `app.js`，需要 **Ctrl+Shift+R** 硬刷新。
 
 ---
 
-## 第二把锁：Spring Boot 文件大小限制
+## ② 第二道关：Spring Boot 默认 1MB 限制
 
-### 锁在哪里
+Spring Boot 框架默认最大上传文件 **1MB**。PDF/DOCX 动辄几 MB，一上传就被拒。
 
-Spring Boot 框架默认有一个**最大上传文件大小限制：1MB**。
-
-这个配置写在框架代码里，你在项目里找不到——它就像小区大门的默认门禁规则："超过 1MB 的包裹不准进门"。
-
-### 为什么 1MB 不够
-
-| 文件类型 | 典型大小 |
-|---------|---------|
-| `.txt` 纯文本 | 几 KB ~ 几十 KB |
-| `.md` Markdown | 几 KB ~ 几十 KB |
-| `.pdf` PDF 文档 | **几百 KB ~ 几十 MB** |
-| `.docx` Word 文档 | **几十 KB ~ 几十 MB** |
-
-纯文本文件几乎不会超过 1MB，所以默认限制一直没暴露出问题。但 PDF 和 Word 文档动辄几 MB 甚至几十 MB，一上传就直接被后端拒之门外。
-
-### 怎么修
-
-在 `application.yml` 里显式声明更大的限制：
+**修复 — `application.yml`：**
 
 ```yaml
 spring:
   servlet:
     multipart:
-      max-file-size: 50MB      # 单个文件最大 50MB
-      max-request-size: 50MB   # 整个请求体最大 50MB
+      max-file-size: 50MB
+      max-request-size: 50MB
 ```
 
-> **为什么要设 50MB？**
-> - 前端 `app.js` 里也有一个 50MB 的校验（`const maxSize = 50 * 1024 * 1024`），前后端保持一致
-> - 足以覆盖大部分 PDF 和 Word 文件
-> - 再大的话向量化会很慢，用户体验不好
+> 50MB 与前端 `app.js` 的校验值保持一致。
 
 ---
 
-## 第三把锁：FormContentFilter 偷吃请求体
+## ③ 第三道关：`@RequestParam` 与 Spring 封装层
 
-### 这个问题最隐蔽
+### 这个坑最难排查
 
-> **这是你遇到的 400 错误的真正原因。** 前两把锁修好之后，你发现文件已经能在前端选到了，但上传还是报同样的 400 错误——因为请求体在半路被"偷吃"了。
+前两关修好后，用 Apifox 发送正确的 `multipart/form-data` 请求，依旧返回 `400 MissingServletRequestPartException`，说明是纯后端问题。
 
-### 锁在哪里
+### 失败的尝试
 
-Spring Boot 3.2 引入了一个叫 `FormContentFilter` 的新过滤器。它的本职工作是把表单数据（`application/x-www-form-urlencoded`）包装一下，让后端代码更方便读取。
+以下是经过验证**没有解决问题**的方案，记录下来是为了让读者不走弯路：
 
-但 Spring Framework 6.1 版本的 `FormContentFilter` 有一个兼容性缺陷：**它有时会错误地读取 multipart 请求的 body**（也就是你上传的文件内容），读完之后就把 InputStream 关掉了。
+| 尝试 | 结果 | 原因 |
+|------|------|------|
+| 移除 `consumes = "multipart/form-data"` | 无效 | `consumes` 检查不影响 multipart 解析 |
+| 添加 `MultipartFilter`（Filter 层优先解析） | 无效 | `MultipartFilter.isMultipart()` 返回 false，进 else 分支 |
+| 用 `FilterRegistrationBean` 禁用 `FormContentFilter` | **启动报错** | 空壳 `FilterRegistrationBean` 导致 `Filter must not be null` |
+| 用 `@RequestPart` 替代 `@RequestParam` | 未单独验证 | 最终方案已绕过了这个问题 |
 
-等到后面真正负责解析文件的 `MultipartResolver` 去读请求体时，发现**盒子已经被拆开，里面的内容不见了**——于是报出 "Required part 'file' is not present"。
+### 根因分析
 
-### 通俗比喻
-
-想象一个仓库收货流程：
+Spring Boot 3.2 的文件上传经过了太多层抽象：
 
 ```
-快递员(浏览器) → 门卫A(FormContentFilter) → 门卫B(MultipartResolver) → 仓库(Controller)
+请求到达
+  → FormContentFilter（可能影响请求体）
+    → DispatcherServlet.checkMultipart()
+      → MultipartResolver.resolveMultipart()
+        → StandardMultipartHttpServletRequest 包装
+          → Controller @RequestParam("file")
+            → MultipartResolutionDelegate.resolveMultipartArgument()
+              → 取文件
 ```
 
-门卫 A 的职责是处理"普通信件"（表单数据），门卫 B 的职责是处理"包裹"（文件上传）。但门卫 A 不够聪明，看到一个快递盒子上写着"包裹"（multipart/form-data），还是拆开看了一下。虽然他只是看了看就放下了，但是——**盒子已经被打开了，里面的填充物散了**。等到门卫 B 去收货时，盒子是空的。
+任何一个环节出错（比如 `FormContentFilter` 与 `MultipartResolver` 的执行顺序、`MultipartResolver` 的 Bean 注册时机、`Resolver` 与 `ArgumentResolver` 的协作），都会导致"文件不见了"。
 
-### 怎么修
+## ④ 最终方案：甩开 Spring 封装，直接走 Servlet API
 
-**修改 1：移除 Controller 上多余的 `consumes` 限制**
+### 思路
 
-`FileUploadController.java` 原来的写法：
+既然 Spring 的层层封装会丢文件，那就**一步到位**——Controller 直接调用 Servlet 原生的 `HttpServletRequest.getPart("file")`，什么 `@RequestParam`、`MultipartResolver`、`MultipartFilter` 统统不要。
+
+### 最终版 FileUploadController
 
 ```java
-@PostMapping(value = "/api/upload", consumes = "multipart/form-data")
-public ResponseEntity<?> upload(@RequestParam("file") MultipartFile file) {
-```
+@RestController
+public class FileUploadController {
 
-`consumes` 在 Spring Boot 3.2 + FormContentFilter 的组合下有时会干扰请求处理流程。直接去掉：
+    @PostMapping("/api/upload")
+    public ResponseEntity<?> upload(HttpServletRequest request) {
+        // 1. 检查 Content-Type
+        String contentType = request.getContentType();
+        if (contentType == null || !contentType.toLowerCase().startsWith("multipart/")) {
+            return ResponseEntity.badRequest()
+                .body("Content-Type 必须是 multipart/form-data，当前为: " + contentType);
+        }
 
-```java
-@PostMapping("/api/upload")
-public ResponseEntity<?> upload(@RequestParam("file") MultipartFile file) {
-```
+        // 2. 直接调 Servlet API 取文件
+        Part filePart = request.getPart("file");
+        if (filePart == null) {
+            // 列出所有 part 帮助排查
+            return ResponseEntity.badRequest()
+                .body("没有找到 'file' 部件，可用部件: " + listParts(request));
+        }
 
-**修改 2：在 WebMvcConfig 中显式禁用 FormContentFilter + 注册 MultipartResolver**
-
-`WebMvcConfig.java` 中新增两个 Bean：
-
-```java
-/**
- * 显式注册 MultipartResolver，确保 Spring MVC 能正确解析 multipart 请求
- */
-@Bean
-public MultipartResolver multipartResolver() {
-    return new StandardServletMultipartResolver();
+        String originalFilename = filePart.getSubmittedFileName();
+        // ... 保存文件、调用索引服务
+    }
 }
-
-/**
- * 禁用 FormContentFilter，防止它错误消费 multipart 请求体
- */
-@Bean
-public FilterRegistrationBean<FormContentFilter> formContentFilterRegistration() {
-    FilterRegistrationBean<FormContentFilter> registration = new FilterRegistrationBean<>();
-    registration.setEnabled(false);
-    return registration;
-}
 ```
 
-**为什么要这样做？**
+### 为什么这样能工作
 
-| 措施 | 作用 |
-|------|------|
-| 移除 `consumes` | 避免 FormContentFilter + consumes 组合触发请求体的错误读取 |
-| 显式注册 `MultipartResolver` | 确保文件解析器一定会生效，不会因为自动配置被跳过 |
-| 禁用 `FormContentFilter` | 直接关掉这个可能偷吃请求体的过滤器 |
+`request.getPart()` 是 **Java Servlet 3.0** 的原生 API，不经过 Spring 任何封装层。只要 `application.yml` 里配置了 `spring.servlet.multipart.*`（→ `MultipartConfigElement`），Tomcat 就会在调用 `getPart()` 时自动解析 multipart 数据。
 
-> **安全性说明**：禁用 `FormContentFilter` 只会影响 `application/x-www-form-urlencoded` 类型的 PUT/PATCH/DELETE 请求的表单数据读取。你的项目只用 POST 传文件，不受影响。
+对比一下新旧链路：
 
----
+```
+旧方案（不可靠）：
+  请求 → Filters → Spring MultipartResolver → @RequestParam → MultipartResolutionDelegate → 文件
 
-## 完整的修改文件清单
+新方案（可靠）：
+  请求 → request.getPart("file") → 文件
+```
 
-| 文件 | 改了什么 | 原因 |
-|------|---------|------|
-| `src/main/resources/static/index.html` | `<input>` 的 `accept` 属性加入新格式 | 让浏览器允许选择 PDF/DOCX 等文件 |
-| `src/main/resources/static/app.js` | `validateFileType()` 白名单扩展 | 让前端 JS 校验通过新格式 |
-| `src/main/resources/static/app.js` | 错误提示文案更新 | 告诉用户现在支持哪些格式 |
-| `src/main/resources/application.yml` | 新增 `spring.servlet.multipart` 配置 | 把文件大小上限从默认 1MB 提升到 50MB |
-| `src/main/java/.../controller/FileUploadController.java` | 移除 `consumes` 属性 | 避免 FormContentFilter 与 consumes 组合触发 bug |
-| `src/main/java/.../config/WebMvcConfig.java` | 禁用 `FormContentFilter` | 防止它错误消费 multipart 请求体 |
-| `src/main/java/.../config/WebMvcConfig.java` | 显式注册 `MultipartResolver` | 确保文件解析器不会被自动配置跳过 |
+少一层封装就少一个出错点。
 
 ---
 
-## 怎么验证修好了
+## 最终版修改文件清单
 
-### 方法一：网页上传（推荐）
+| 文件 | 改动 | 原因 |
+|------|------|------|
+| `index.html` | `accept` 属性添加 pdf/docx/html/htm/csv/json | 浏览器能选到新格式文件 |
+| `app.js` | `validateFileType()` 白名单 + 两处错误提示 | 前端放行新格式 |
+| `application.yml` | `spring.servlet.multipart.max-file-size: 50MB` | 允许大文件 |
+| `FileUploadController.java` | **重写**：用 `request.getPart("file")` 替代 `@RequestParam` | 绕过 Spring 封装层，直接走 Servlet API |
+| `WebMvcConfig.java` | 保持原始状态，无额外配置 | 不需要 MultipartFilter/MultipartResolver/FilterRegistrationBean |
 
-1. 重启 Spring Boot 服务
-2. 浏览器打开 `http://localhost:9900`
-3. 点击输入框左边的 **`···`** 按钮 → **上传文件**
-4. 选一个 PDF 文件上传
-5. 看到成功提示即表示修复成功
+---
 
-### 方法二：curl 命令测试（Windows PowerShell）
+## 验证方法
+
+### 1. curl 测试（Windows PowerShell）
 
 ```powershell
-# 把下面路径换成你的 PDF 文件路径
-curl -X POST http://localhost:9900/api/upload -F "file=@C:\你的文件.pdf"
+curl -X POST http://localhost:9900/api/upload -F "file=@E:\你的文件.pdf"
 ```
 
-如果返回 `{"code":200,"message":"success",...}` 就说明成功了。
+成功返回：`{"code":200,"message":"success","data":{...}}`
 
-> **常见坑**：Windows 下 `curl` 本质上是 `curl.exe` 的别名，参数规则和 Linux 一样。如果你装了 Git Bash，也可以用那边的 curl。
+### 2. 网页上传
+
+1. 重启服务
+2. 浏览器 **Ctrl+Shift+R** 硬刷新
+3. 点击 `···` → 上传文件 → 选 PDF
+
+### 3. Apifox 配置
+
+- Method：`POST`
+- URL：`http://localhost:9900/api/upload`
+- Body 类型：`form-data`（**不是** JSON，**不是** x-www-form-urlencoded）
+- 字段名：`file`（必须叫这个名字）
+- 字段类型：`File`
 
 ---
 
-## 如果还不行？—— 更多排查点
-
-### 1. 检查你的 curl 命令格式
-
-**错误写法（会报 400）：**
+## curl 命令速查
 
 ```bash
-# ❌ 用了 JSON body（-d）
+# ✅ 正确：-F 上传文件，字段名 file
+curl -X POST http://localhost:9900/api/upload -F "file=@文件路径"
+
+# ❌ 错误：用了 -d（JSON body）
 curl -X POST http://localhost:9900/api/upload -d '{"file":"test.pdf"}'
 
-# ❌ 参数名写错了
+# ❌ 错误：字段名不是 file
 curl -X POST http://localhost:9900/api/upload -F "pdf=@test.pdf"
-```
 
-**正确写法：**
-
-```bash
-# ✅ 必须用 -F，参数名必须是 file
-curl -X POST http://localhost:9900/api/upload -F "file=@test.pdf"
-```
-
-### 2. 检查后端日志
-
-如果上传后看到这个日志：
-
-```
-WARN ... MissingServletRequestPartException: Required part 'file' is not present.
-```
-
-说明请求根本没带文件。可能的原因：
-- 用 `-d`（JSON body）而不是 `-F`（multipart form）
-- 表单字段名写错了（必须是 `file`）
-- 用了 GET 而不是 POST
-
-### 3. 检查文件大小
-
-即便改到了 50MB，超出 50MB 的文件还是会被拒绝。可以临时调大测试：
-
-```yaml
-spring:
-  servlet:
-    multipart:
-      max-file-size: 200MB
-      max-request-size: 200MB
+# ❌ 错误：方法不是 POST
+curl http://localhost:9900/api/upload -F "file=@test.pdf"
 ```
 
 ---
@@ -304,25 +253,32 @@ spring:
 
 | 概念 | 通俗理解 |
 |------|---------|
-| `multipart/form-data` | 一种 HTTP 请求格式，专门用来传文件。和 JSON（纯文本）不同，它能携带二进制数据 |
-| `@RequestParam("file")` | 后端接口说"我要一个名叫 `file` 的表单字段" |
-| `accept` 属性 | 前端文件选择框的过滤器，用来限制用户只能看到特定格式的文件 |
-| `max-file-size` | 后端的包裹尺寸限制，超限的请求直接拒收 |
-| `-F` vs `-d` | curl 中 `-F` = 表单上传，`-d` = 纯文本 JSON。传文件只能用 `-F` |
-| `FormContentFilter` | Spring Boot 3.2 的过滤器，负责处理普通表单数据，但有时会"偷吃" multipart 请求体 |
-| `MultipartResolver` | 后端专门负责拆包裹（解析文件）的组件，比如 `StandardServletMultipartResolver` |
-| `FilterRegistrationBean` | Spring 用来控制某个过滤器是否启用、执行顺序的配置类 |
+| `multipart/form-data` | HTTP 传文件的专用格式，能携带二进制数据 |
+| `request.getPart()` | Servlet 原生 API，直接从请求中取文件部件，不经过 Spring 封装 |
+| `@RequestParam("file") MultipartFile` | Spring 封装方式，依赖 MultipartResolver 链，在 Boot 3.2 下不稳定 |
+| `accept` 属性 | 前端文件选择框的过滤器 |
+| `max-file-size` | 后端文件大小上限 |
+| `-F` vs `-d` | curl 传文件用 `-F`，传 JSON 用 `-d` |
 
 ---
 
-## 三把锁的解决顺序（踩坑心得）
-
-这三把锁是按"发现顺序"慢慢暴露出来的：
+## 踩坑心得
 
 ```
-第一次上传 PDF → 前端根本选不到文件 → 发现第一把锁（accept/validateFileType）
-修改后能选到文件了 → 上传还是 400 → 看日志发现 body 为空 → 发现第二把锁（1MB 限制）
-改完大小限制 → 还是 400 → 排查堆栈看到 FormContentFilter → 发现第三把锁（过滤器偷吃）
+第一次上传 PDF
+  → 前端选不到文件 → 发现 accept/validateFileType 白名单 ← ①
+
+改完能选文件了
+  → 上传报 400 → 发现 Spring 默认 1MB 限制 ← ②
+
+改完大小限制
+  → Apifox 正确请求仍 400 → 尝试 MultipartFilter/FilterRegistrationBean/consumes
+    → MultipartFilter 无效，FilterRegistrationBean 空壳启动报错
+    → 发现 Spring 封装链路太深不可靠 ← ③
+
+最终方案
+  → 甩开 Spring 封装，直接 `request.getPart("file")` ← ④
+  → curl 测试成功 ✓
 ```
 
-**经验**：排查 web 上传问题时，沿着"浏览器 → 网络 → 过滤器链 → 业务代码"这条链路逐个排除，而不是只看最后的错误信息。
+**核心经验**：排查 Spring Boot 的 multipart 上传问题时，如果 `@RequestParam` + `MultipartResolver` 链路屡试不灵，就降级到 Servlet 原生 API——它比 Spring 的任何封装都可靠。
