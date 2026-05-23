@@ -23,7 +23,7 @@ milvus:
 spring:
   ai:
     dashscope:
-      api-key: ${DASHSCOPE_API_KEY:******************}  # 从环境变量读取或使用默认值
+      api-key: ${QWEN_KEY}  # 从环境变量读取或使用默认值
       chat:
         options:
           timeout: 180000  # 超时时间180秒（3分钟）
@@ -46,13 +46,13 @@ spring:
         sse:
           connections:
             tencent-cls:
-              url: https://mcp-api.tencent-cloud.com
-              sse-endpoint: /sse/************  # 完整的SSE端点路径
+              url: http://localhost:3000
+              sse-endpoint: /sse  # 完整的SSE端点路径
 
 # 阿里云 DashScope Embedding API 配置
 dashscope:
   api:
-    key: ${DASHSCOPE_API_KEY:******************}  # 从环境变量读取或使用默认值（用于自定义配置）
+    key: ${QWEN_KEY}  # 从环境变量读取或使用默认值（用于自定义配置）
   embedding:
     model: text-embedding-v4  # 阿里云文本向量化模型
 
@@ -64,8 +64,13 @@ document:
 
 # RAG 配置
 rag:
-  top-k: 3  # 检索返回的最相似文档数量
+  top-k: 3          # 最终保留给 LLM 的最相关文档数量
+  recall-k: 20      # 向量检索宽召回数量（给重排模型提供更多候选）
   model: "qwen3-max"  # 大语言模型名称
+  rerank:
+    enabled: false      # 是否启用重排（true=启用, false=关闭）
+    model: "gte-rerank" # 重排模型名称
+    max-doc-length: 4000  # 单篇文档最大字符数（超过会被截断）
 
 # Prometheus 配置
 prometheus:

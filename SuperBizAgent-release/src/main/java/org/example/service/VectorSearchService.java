@@ -94,6 +94,19 @@ public class VectorSearchService {
     }
 
     /**
+     * 搜索相似文档（宽召回模式，用于后续重排）
+     * 一次召回较多文档，保证覆盖面
+     *
+     * @param query 查询文本
+     * @param topK  返回数量（建议 20）
+     * @return 搜索结果列表（未排序，给重排模型使用）
+     */
+    public List<SearchResult> searchSimilarDocumentsWide(String query, int topK) {
+        logger.info("宽召回模式, topK: {}", topK);
+        return searchSimilarDocuments(query, topK);
+    }
+
+    /**
      * 搜索结果类
      */
     @Setter
