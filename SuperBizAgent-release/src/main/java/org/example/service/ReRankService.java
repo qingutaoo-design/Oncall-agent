@@ -4,7 +4,6 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
-import com.google.gson.reflect.TypeToken;
 import okhttp3.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -13,25 +12,25 @@ import org.springframework.stereotype.Service;
 
 import jakarta.annotation.PostConstruct;
 import java.io.IOException;
-import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 /**
  * 重排（ReRank）服务
  * 调用阿里云 DashScope 的 gte-rerank 模型，对检索结果进行二次打分排序。
  *
- * 大白话解释：
- * 向量检索找到一堆"可能相关"的文档 → 这个服务帮我们判断到底哪些才是"真正相关"的。
+ * 简单理解：
+ * 向量检索找到了 20 篇"可能相关"的文档 → 这个服务帮 Agent 挑出其中最相关的 3 篇。
  */
 @Service
 public class ReRankService {
 
     private static final Logger logger = LoggerFactory.getLogger(ReRankService.class);
 
-    /** DashScope ReRank API 地址 */
+    /** DashScope ReRank API 地址（不要改） */
     private static final String RERANK_API_URL =
             "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank";
 
@@ -42,7 +41,7 @@ public class ReRankService {
     @Value("${rag.rerank.model:gte-rerank}")
     private String rerankModel;
 
-    /** 单个文档最大字符数，超过会被截断（保护 API 调用不超限） */
+    /** 单篇文档最大字符数，超过会被截断（保护 API 调用不超限） */
     @Value("${rag.rerank.max-doc-length:4000}")
     private int maxDocLength;
 
@@ -60,13 +59,17 @@ public class ReRankService {
     }
 
     /**
-     * 对文档列表进行重排
+     * 核心方法：对文档列表进行重排
      *
-     * @param query     用户的原始问题
-     * @param documents 待重排的文档内容列表（来自向量检索的粗筛结果）
-     * @param topN      最终要保留几条（比如 3）
-     * @return 重排后的结果列表，按相关性从高到低排序，最多 topN 条
-     * @throws RuntimeException 如果 API 调用失败（不降级策略）
+     * 把用户问题 + 一堆文档一起发给阿里云的重排模型，
+     * 模型会逐一打分（0~1 之间的浮点数，越高越相关），
+     * 最后返回分数最高的 topN 条。
+     *
+     * @param query     用户问题（Agent 传给工具的 query 参数）
+     * @param documents 向量检索粗筛出来的文档内容列表
+     * @param topN      最终保留几条（比如 3）
+     * @return 重排后的结果列表，按相关性从高到低排序
+     * @throws RuntimeException 如果 API 调用失败（不降级）
      */
     public List<ReRankResult> rerank(String query, List<String> documents, int topN) {
         if (documents == null || documents.isEmpty()) {
@@ -77,11 +80,10 @@ public class ReRankService {
         logger.info("开始重排, 查询: {}, 文档数: {}, topN: {}", query, documents.size(), topN);
 
         try {
-            // ----- 第 1 步：构建请求体 -----
+            // 第 1 步：按照阿里云要求的格式，构建请求 JSON
             JsonObject requestBody = buildRequestBody(query, documents, topN);
-            logger.debug("重排请求体: {}", requestBody.toString());
 
-            // ----- 第 2 步：发送 HTTP POST 请求 -----
+            // 第 2 步：发送 HTTP POST 请求到阿里云
             Request request = new Request.Builder()
                     .url(RERANK_API_URL)
                     .addHeader("Authorization", "Bearer " + apiKey)
@@ -94,33 +96,31 @@ public class ReRankService {
             try (Response response = httpClient.newCall(request).execute()) {
                 String responseBody = response.body() != null ? response.body().string() : "";
 
-                // ----- 第 3 步：检查 HTTP 状态码 -----
                 if (!response.isSuccessful()) {
-                    logger.error("重排 API 返回错误, 状态码: {}, 响应体: {}", response.code(), responseBody);
+                    logger.error("重排 API 返回错误, 状态码: {}, 响应: {}", response.code(), responseBody);
                     throw new RuntimeException(String.format(
                             "重排 API 调用失败 (HTTP %d): %s", response.code(), responseBody));
                 }
 
-                // ----- 第 4 步：解析响应，提取结果 -----
+                // 第 3 步：解析阿里云返回的 JSON，提取打分结果
                 return parseResponse(responseBody, documents);
             }
 
         } catch (IOException e) {
             logger.error("重排 API 网络调用失败", e);
-            // 不降级：直接抛出异常
             throw new RuntimeException("重排服务调用失败，网络异常: " + e.getMessage(), e);
         }
     }
 
     /**
-     * 构建 DashScope ReRank API 请求体
+     * 构建请求体 JSON
      *
-     * 请求格式示例：
+     * 发给阿里云的 JSON 大概长这样：
      * {
      *   "model": "gte-rerank",
      *   "input": {
-     *     "query": "什么是Java",
-     *     "documents": ["文档1", "文档2", "文档3"]
+     *     "query": "CPU过高怎么排查",
+     *     "documents": ["文档1内容...", "文档2内容...", ...]
      *   },
      *   "parameters": {
      *     "top_n": 3,
@@ -132,22 +132,20 @@ public class ReRankService {
         JsonObject body = new JsonObject();
         body.addProperty("model", rerankModel);
 
-        // input.query
         JsonObject input = new JsonObject();
         input.addProperty("query", query);
 
-        // input.documents - 对长文档做截断保护
         JsonArray docsArray = new JsonArray();
         for (String doc : documents) {
-            String truncatedDoc = doc.length() > maxDocLength
+            // 如果某篇文档太长，截断它，避免 API 报错
+            String safeDoc = doc.length() > maxDocLength
                     ? doc.substring(0, maxDocLength) + "..."
                     : doc;
-            docsArray.add(truncatedDoc);
+            docsArray.add(safeDoc);
         }
         input.add("documents", docsArray);
         body.add("input", input);
 
-        // parameters
         JsonObject parameters = new JsonObject();
         parameters.addProperty("top_n", topN);
         parameters.addProperty("return_documents", true);
@@ -157,29 +155,32 @@ public class ReRankService {
     }
 
     /**
-     * 解析 API 响应
+     * 解析阿里云返回的响应 JSON
      *
-     * 响应格式示例：
+     * 阿里云返回的 JSON 大概长这样：
      * {
      *   "output": {
      *     "results": [
      *       { "index": 0, "document": { "text": "..." }, "relevance_score": 0.99 },
-     *       { "index": 2, "document": { "text": "..." }, "relevance_score": 0.87 }
+     *       { "index": 2, "document": { "text": "..." }, "relevance_score": 0.87 },
+     *       { "index": 1, "document": { "text": "..." }, "relevance_score": 0.45 }
      *     ]
      *   }
      * }
+     *
+     * index: 这条文档在原文档列表中的位置（第 0 篇、第 1 篇...）
+     * relevance_score: 相关性分数，0~1，越大越相关
      */
     private List<ReRankResult> parseResponse(String responseBody, List<String> originalDocuments) {
         JsonObject responseJson = JsonParser.parseString(responseBody).getAsJsonObject();
 
-        // 检查是否有错误信息
+        // 如果返回了错误码，直接抛异常
         if (responseJson.has("code") && responseJson.has("message")) {
             String code = responseJson.get("code").getAsString();
             String message = responseJson.get("message").getAsString();
             throw new RuntimeException(String.format("重排 API 业务错误 (code=%s): %s", code, message));
         }
 
-        // 提取 results 数组
         JsonArray results = responseJson
                 .getAsJsonObject("output")
                 .getAsJsonArray("results");
@@ -191,17 +192,17 @@ public class ReRankService {
             double score = item.get("relevance_score").getAsDouble();
             String documentText = item.has("document")
                     ? item.getAsJsonObject("document").get("text").getAsString()
-                    : (originalIndex < originalDocuments.size() ? originalDocuments.get(originalIndex) : "");
+                    : (originalIndex < originalDocuments.size()
+                    ? originalDocuments.get(originalIndex) : "");
 
             ReRankResult result = new ReRankResult();
             result.setIndex(originalIndex);
             result.setContent(documentText);
             result.setRelevanceScore(score);
-
             resultList.add(result);
         }
 
-        // 按相关性分数从高到低排序（API 返回的一般已经排好序，但这里再排一次保证安全）
+        // 按分数从高到低排序（API 一般已排好，但再排一次确保安全）
         resultList.sort(Comparator.comparingDouble(ReRankResult::getRelevanceScore).reversed());
 
         logger.info("重排完成, 返回 {} 条结果, 最高分: {}, 最低分: {}",
@@ -215,7 +216,7 @@ public class ReRankService {
     // ==================== 数据类 ====================
 
     /**
-     * 重排结果
+     * 一条重排结果
      */
     public static class ReRankResult {
         /** 在原文档列表中的下标（从 0 开始） */
@@ -231,12 +232,5 @@ public class ReRankService {
         public void setContent(String content) { this.content = content; }
         public double getRelevanceScore() { return relevanceScore; }
         public void setRelevanceScore(double relevanceScore) { this.relevanceScore = relevanceScore; }
-
-        @Override
-        public String toString() {
-            return String.format("ReRankResult{index=%d, score=%.4f, content=%s}",
-                    index, relevanceScore,
-                    content.length() > 50 ? content.substring(0, 50) + "..." : content);
-        }
     }
 }
