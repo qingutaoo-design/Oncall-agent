@@ -26,6 +26,7 @@ spring:
       api-key: ${QWEN_KEY}  # 从环境变量读取或使用默认值
       chat:
         options:
+          model: qwen-max  # 大语言模型名称
           timeout: 180000  # 超时时间180秒（3分钟）
       retry:
         max-attempts: 3  # 最大重试次数
@@ -65,10 +66,10 @@ document:
 # RAG 配置
 rag:
   top-k: 3          # 最终保留给 LLM 的最相关文档数量
-  recall-k: 20      # 向量检索宽召回数量（给重排模型提供更多候选）
+  recall-k: 6      # 向量检索宽召回数量（给重排模型提供更多候选）
   model: "qwen3-max"  # 大语言模型名称
   rerank:
-    enabled: false      # 是否启用重排（true=启用, false=关闭）
+    enabled: true      # 是否启用重排（true=启用, false=关闭）
     model: "gte-rerank" # 重排模型名称
     max-doc-length: 4000  # 单篇文档最大字符数（超过会被截断）
 
