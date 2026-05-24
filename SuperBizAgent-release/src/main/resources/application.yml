@@ -60,6 +60,9 @@ dashscope:
     key: ${QWEN_KEY}  # 从环境变量读取或使用默认值（用于自定义配置）
   embedding:
     model: text-embedding-v4  # 阿里云文本向量化模型
+    cache:
+      max-size: 500            # 最大缓存条目数（防止内存溢出）
+      expire-after-write: 24h  # 写入后过期时间（向量不会频繁变化）
 
 document:
   chunk:
