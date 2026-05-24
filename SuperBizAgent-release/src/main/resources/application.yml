@@ -86,3 +86,11 @@ prometheus:
 # CLS 云日志服务配置
 cls:
   mock-enabled: false  # 是否启用 Mock 模式（用于测试，设为 true 返回与告警关联的模拟日志数据）
+
+# 上下文窗口压缩配置（对话摘要+滑动窗口）
+context:
+  compression:
+    enabled: true                 # 是否启用历史压缩
+    threshold: 2                  # 超过多少对消息触发压缩
+    keep-recent-pairs: 1          # 压缩后保留的最近消息对数
+    summary-max-tokens: 300       # 摘要的最大 token 数

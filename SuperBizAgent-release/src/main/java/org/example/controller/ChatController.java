@@ -17,6 +17,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -54,8 +55,21 @@ public class ChatController {
     // 存储会话信息
     private final Map<String, SessionInfo> sessions = new ConcurrentHashMap<>();
     
-    // 最大历史消息窗口大小（成对计算：用户消息+AI回复=1对）
-    private static final int MAX_WINDOW_SIZE = 6;
+    // ═══════════════════════════════════════════════════════════
+    // 上下文窗口压缩（对话摘要+滑动窗口）配置
+    // ═══════════════════════════════════════════════════════════
+
+    /** 是否启用历史压缩 */
+    @Value("${context.compression.enabled:true}")
+    private boolean compressionEnabled;
+
+    /** 超过多少对消息触发压缩（默认6对） */
+    @Value("${context.compression.threshold:6}")
+    private int compressThreshold;
+
+    /** 压缩后保留的最近消息对数（默认3对） */
+    @Value("${context.compression.keep-recent-pairs:3}")
+    private int keepRecentPairs;
 
     /**
      * 普通对话接口（支持工具调用）
@@ -75,9 +89,10 @@ public class ChatController {
             // 获取或创建会话
             SessionInfo session = getOrCreateSession(request.getId());
             
-            // 获取历史消息
+            // 获取历史消息 + 对话摘要
             List<Map<String, String>> history = session.getHistory();
-            logger.info("会话历史消息对数: {}", history.size() / 2);
+            String summary = session.getConversationSummary();
+            logger.info("会话历史消息对数: {}, 有摘要: {}", history.size() / 2, summary != null);
 
             // 创建 DashScope API 和 ChatModel
             DashScopeApi dashScopeApi = chatService.createDashScopeApi();
@@ -88,8 +103,8 @@ public class ChatController {
 
             logger.info("开始 ReactAgent 对话（支持自动工具调用）");
             
-            // 构建系统提示词（包含历史消息）
-            String systemPrompt = chatService.buildSystemPrompt(history);
+            // 构建系统提示词（对话摘要 + 近期对话）
+            String systemPrompt = chatService.buildSystemPrompt(history, summary);
             
             // 创建 ReactAgent
             ReactAgent agent = chatService.createReactAgent(chatModel, systemPrompt);
@@ -101,6 +116,9 @@ public class ChatController {
             session.addMessage(request.getQuestion(), fullAnswer);
             logger.info("已更新会话历史 - SessionId: {}, 当前消息对数: {}", 
                 request.getId(), session.getMessagePairCount());
+            
+            // 对话完成后，检查是否需要压缩历史（不阻塞用户响应）
+            compressSessionIfNeeded(session);
             
             return ResponseEntity.ok(ApiResponse.success(ChatResponse.success(fullAnswer)));
 
@@ -163,9 +181,10 @@ public class ChatController {
                 // 获取或创建会话
                 SessionInfo session = getOrCreateSession(request.getId());
                 
-                // 获取历史消息
+                // 获取历史消息 + 对话摘要
                 List<Map<String, String>> history = session.getHistory();
-                logger.info("ReactAgent 会话历史消息对数: {}", history.size() / 2);
+                String summary = session.getConversationSummary();
+                logger.info("ReactAgent 会话历史消息对数: {}, 有摘要: {}", history.size() / 2, summary != null);
 
                 // 创建 DashScope API 和 ChatModel
                 DashScopeApi dashScopeApi = chatService.createDashScopeApi();
@@ -176,8 +195,8 @@ public class ChatController {
 
                 logger.info("开始 ReactAgent 流式对话（支持自动工具调用）");
                 
-                // 构建系统提示词（包含历史消息）
-                String systemPrompt = chatService.buildSystemPrompt(history);
+                // 构建系统提示词（对话摘要 + 近期对话）
+                String systemPrompt = chatService.buildSystemPrompt(history, summary);
                 
                 // 创建 ReactAgent
                 ReactAgent agent = chatService.createReactAgent(chatModel, systemPrompt);
@@ -248,6 +267,9 @@ public class ChatController {
                             session.addMessage(request.getQuestion(), fullAnswer);
                             logger.info("已更新会话历史 - SessionId: {}, 当前消息对数: {}", 
                                 request.getId(), session.getMessagePairCount());
+                            
+                            // 对话完成后，检查是否需要压缩历史（不阻塞用户响应）
+                            compressSessionIfNeeded(session);
                             
                             // 发送完成标记
                             emitter.send(SseEmitter.event()
@@ -400,6 +422,79 @@ public class ChatController {
 
     // ==================== 辅助方法 ====================
 
+    /**
+     * 检查并执行历史压缩
+     *
+     * 核心逻辑：
+     * 1. 检查会话的原始消息对数是否超过压缩阈值
+     * 2. 如果是，取最旧的 N 对消息，调 LLM 压缩成摘要
+     * 3. 将摘要存入 session，删除已被压缩的原始消息
+     *
+     * 这样后续的对话 context 中：
+     * - 远期对话 → 保留在摘要中（~200 tokens）
+     * - 近期对话 → 以原始形式保留（方便模型准确理解）
+     *
+     * 压缩是在用户收到回复之后异步执行的，所以不增加用户等待时间。
+     * 即使压缩失败（如网络超时），原会话数据也完整保留，不影响下次对话。
+     */
+    private void compressSessionIfNeeded(SessionInfo session) {
+        // 如果未启用压缩，跳过
+        if (!compressionEnabled) {
+            return;
+        }
+
+        int pairCount = session.getMessagePairCount();
+        if (pairCount < compressThreshold) {
+            return;  // 还没到压缩阈值，不处理
+        }
+
+        // 计算这次要压缩几对：保留 keepRecentPairs 对，剩下的都压缩
+        // 例如：compressThreshold=6, keepRecentPairs=3, 当前有7对
+        // 则压缩 7-3 = 4 对，保留最新的3对
+        int compressCount = pairCount - keepRecentPairs;
+        if (compressCount <= 0) {
+            return;
+        }
+
+        logger.info("会话 {} 触发历史压缩: {} 对中压缩 {} 对，保留最近 {} 对",
+            session.sessionId, pairCount, compressCount, keepRecentPairs);
+
+        try {
+            // 取最旧的 N 对消息
+            List<Map<String, String>> oldestPairs = session.getOldestHistoryPairs(compressCount);
+            if (oldestPairs.isEmpty()) {
+                return;
+            }
+
+            // 调 LLM 压缩成摘要
+            String newSummary = chatService.compressHistory(oldestPairs);
+            if (newSummary == null) {
+                logger.warn("会话 {} 压缩失败，保持原始消息不变", session.sessionId);
+                return;
+            }
+
+            // 把新摘要拼接到已有的摘要后面（如果之前已经有摘要的话）
+            String existingSummary = session.getConversationSummary();
+            if (existingSummary != null && !existingSummary.isEmpty()) {
+                session.setConversationSummary(existingSummary + " " + newSummary);
+            } else {
+                session.setConversationSummary(newSummary);
+            }
+
+            // 删除已被压缩的原始消息
+            session.removeOldestPairs(compressCount);
+
+            logger.info("会话 {} 压缩成功: 摘要长度={}, 剩余消息={} 对",
+                session.sessionId,
+                session.getConversationSummary().length(),
+                session.getMessagePairCount());
+
+        } catch (Exception e) {
+            // 压缩失败不影响主流程
+            logger.error("会话 {} 压缩异常（已安全捕获）", session.sessionId, e);
+        }
+    }
+
     private SessionInfo getOrCreateSession(String sessionId) {
         if (sessionId == null || sessionId.isEmpty()) {
             sessionId = UUID.randomUUID().toString();
@@ -411,25 +506,31 @@ public class ChatController {
 
     /**
      * 会话信息
-     * 管理单个会话的历史消息，支持自动清理和线程安全
+     * 管理单个会话的历史消息 + 对话摘要，支持「对话摘要+滑动窗口」压缩
      */
     private static class SessionInfo {
         private final String sessionId;
-        // 存储历史消息对：[{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+        // 存储近期历史消息（压缩后只保留最近 N 对原始消息）
         private final List<Map<String, String>> messageHistory;
+        // 历史对话摘要（由 LLM 压缩旧对话生成，保留核心语义）
+        private String conversationSummary;
         private final long createTime;
         private final ReentrantLock lock;
 
         public SessionInfo(String sessionId) {
             this.sessionId = sessionId;
             this.messageHistory = new ArrayList<>();
+            this.conversationSummary = null;
             this.createTime = System.currentTimeMillis();
             this.lock = new ReentrantLock();
         }
 
         /**
          * 添加一对消息（用户问题 + AI回复）
-         * 自动管理历史消息窗口大小
+         *
+         * 注意：这里不再做"到数就删"的粗暴截断，
+         * 压缩逻辑由 ChatController 在调用 addMessage 之后统一触发，
+         * 这样压缩（调 LLM 做摘要）不阻塞用户响应。
          */
         public void addMessage(String userQuestion, String aiAnswer) {
             lock.lock();
@@ -446,18 +547,7 @@ public class ChatController {
                 assistantMsg.put("content", aiAnswer);
                 messageHistory.add(assistantMsg);
 
-                // 自动清理：保持最多 MAX_WINDOW_SIZE 对消息
-                // 每对消息包含2条记录（user + assistant）
-                int maxMessages = MAX_WINDOW_SIZE * 2;
-                while (messageHistory.size() > maxMessages) {
-                    // 成对删除最旧的消息（删除前2条）
-                    messageHistory.remove(0); // 删除最旧的用户消息
-                    if (!messageHistory.isEmpty()) {
-                        messageHistory.remove(0); // 删除对应的AI回复
-                    }
-                }
-
-                logger.debug("会话 {} 更新历史消息，当前消息对数: {}", 
+                logger.debug("会话 {} 添加消息对，当前消息对数: {}",
                     sessionId, messageHistory.size() / 2);
 
             } finally {
@@ -466,8 +556,7 @@ public class ChatController {
         }
 
         /**
-         * 获取历史消息（线程安全）
-         * 返回副本以避免并发修改
+         * 获取近期历史消息（线程安全）
          */
         public List<Map<String, String>> getHistory() {
             lock.lock();
@@ -479,20 +568,77 @@ public class ChatController {
         }
 
         /**
-         * 清空历史消息
+         * 获取最旧的 N 对消息（用于压缩）
          */
-        public void clearHistory() {
+        public List<Map<String, String>> getOldestHistoryPairs(int pairCount) {
             lock.lock();
             try {
-                messageHistory.clear();
-                logger.info("会话 {} 历史消息已清空", sessionId);
+                int totalPairs = messageHistory.size() / 2;
+                int takePairs = Math.min(pairCount, totalPairs);
+                if (takePairs <= 0) return List.of();
+                return new ArrayList<>(messageHistory.subList(0, takePairs * 2));
             } finally {
                 lock.unlock();
             }
         }
 
         /**
-         * 获取当前消息对数
+         * 删除最旧的 N 对消息（压缩完成后清理原始消息）
+         */
+        public void removeOldestPairs(int pairCount) {
+            lock.lock();
+            try {
+                int toRemove = Math.min(pairCount * 2, messageHistory.size());
+                for (int i = 0; i < toRemove; i++) {
+                    messageHistory.remove(0);
+                }
+                logger.debug("会话 {} 压缩清理 {} 对消息，剩余: {} 对",
+                    sessionId, pairCount, messageHistory.size() / 2);
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        /**
+         * 获取对话摘要
+         */
+        public String getConversationSummary() {
+            lock.lock();
+            try {
+                return conversationSummary;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        /**
+         * 设置对话摘要
+         */
+        public void setConversationSummary(String summary) {
+            lock.lock();
+            try {
+                this.conversationSummary = summary;
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        /**
+         * 清空历史消息和摘要
+         */
+        public void clearHistory() {
+            lock.lock();
+            try {
+                messageHistory.clear();
+                this.conversationSummary = null;
+                logger.info("会话 {} 历史消息和摘要已清空", sessionId);
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        /**
+         * 获取当前消息对数（仅计算未压缩的原始消息）
          */
         public int getMessagePairCount() {
             lock.lock();

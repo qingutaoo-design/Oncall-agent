@@ -43,7 +43,7 @@ public class InternalDocsTools {
     private boolean rerankEnabled; // 是否启用重排，默认启用
 
     @Value("${rag.recall-k:20}")
-    private final int recallK = 6; // 重排时的宽召回数量，固定为 20 条（可以调整，但不宜过大）
+    private int recallK; // 重排时的宽召回数量，固定为 20 条（可以调整，但不宜过大）
     
     /**
      * 构造函数注入依赖
