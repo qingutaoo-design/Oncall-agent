@@ -379,6 +379,18 @@ VectorEmbeddingService
 
 ---
 
+## 🤔 为什么选 Caffeine 而不是 Redis？
+
+你可能会问：**"缓存不是应该用 Redis 吗？"**
+
+这个问题我单独写了篇文档，从安装成本、读取速度、数据量、业务发展阶段四个角度详细拆解了 Caffeine vs Redis 的选型决策，附带决策表帮你判断什么条件下该换。
+
+👉 **[点这里看完整分析 → 技术选型：Caffeine vs Redis](caffeine-vs-redis.md)**
+
+简单总结就是一句话：**你现在单实例、数据才 3MB、重启丢了也无感，Caffeine 正好，Redis 太重。**
+
+---
+
 ## 💡 总结
 
 | 问题 | 解决方式 |
